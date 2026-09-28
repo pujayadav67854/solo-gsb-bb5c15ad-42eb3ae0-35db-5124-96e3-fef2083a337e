@@ -27,6 +27,16 @@
  * 区间合法），任一错误按字段路径逐条提示且当前工作不变；通过后一次性替换当前工作，
  * 复用匿名化引擎重算预览与巡检，复核确认仅保留与当前替换完全匹配者，撤销栈清空，
  * 继续新增人物或区间不复用文件中已有的 ID。文件读写全部在浏览器本地完成。
+ *
+ * 人物规则模板：侧栏 / 顶部「导出人物规则模板」把当前人物的统一代号与称呼导出为
+ * version=1 的本地 JSON（同代号多位人物导出时合并为一项、称呼取并集去重），不含原稿、
+ * 框选、例外、引文、裁决与 ID。「导入人物规则模板」先整体校验（版本 / 字段类型 /
+ * 模板内重复代号），任一错误按路径提示且当前工作不变；校验通过后按「完全相同代号」
+ * 试算并在应用前展示：将新增的人物、按同代号合并的称呼、以及由此产生的共享称呼；
+ * 若某代号当前对应多位人物则阻止应用并提示先在编辑器内合并。确认后新增人物分配未使用
+ * ID、合并称呼去重；仅保留候选集合（aliasOwners）未变化且仍指向候选人物的有效裁决，
+ * 其余新冲突回到待人工裁决；随后重算预览、巡检与复核（确认只保留完全相同的替换）。
+ * 原稿、框选、保留例外与引文一律不变；整次应用作为一条撤销记录。文件读写留在浏览器本地。
  */
 (function () {
   'use strict';
@@ -72,6 +82,11 @@
   var batchDialog = $('batchDialog'), batchFrag = $('batchFrag'), batchTargetEl = $('batchTarget');
   var batchTotal = $('batchTotal'), batchOk = $('batchOk');
   var batchClashSel = $('batchClashSel'), batchClashEx = $('batchClashEx');
+  var templateDialog = $('templateDialog');
+  var templateAmbiguous = $('templateAmbiguous');
+  var tplNewList = $('tplNewList'), tplMergeList = $('tplMergeList'), tplSharedList = $('tplSharedList');
+  var tplNewCount = $('tplNewCount'), tplMergeCount = $('tplMergeCount'), tplSharedCount = $('tplSharedCount');
+  var tplRetained = $('tplRetained'), tplUnchanged = $('tplUnchanged');
   var citationList = $('citationList');
   var reviewListEl = $('reviewList'), reviewStatsEl = $('reviewStats');
   var toastEl = $('toast');
@@ -313,6 +328,8 @@
     $('btnUndo').disabled = state.history.length === 0;
     $('btnCopy').disabled = !state.text;
     $('btnDownloadPack').disabled = !state.text;
+    $('btnImportTemplate').disabled = !state.text;
+    $('btnDownloadTemplate').disabled = !state.text || state.persons.length === 0;
   }
 
   function renderPersons() {
@@ -1047,6 +1064,7 @@
     closePopup();
     closeMergeDialog();
     closeBatchDialog();
+    closeTemplateDialog();
     inputSection.classList.add('hidden');
     editorSection.classList.remove('hidden');
     $('btnResetText').classList.remove('hidden');
@@ -1088,6 +1106,247 @@
       window.alert('工作包读取失败，当前工作保持不变。');
     };
     reader.readAsText(file, 'utf-8');
+  });
+
+  // ---------- 人物规则模板（导出 / 导入 / 应用预览，全程浏览器本地完成） ----------
+  // 模板（version=1）只含统一代号与称呼，不含原稿、框选、例外、引文、裁决与 ID：
+  // { version:1, persons:[{ codename, aliases:[] }] }。
+  // 导入先整体校验（Anonymizer.validatePersonTemplate），任一错误按字段路径逐条提示，
+  // 当前工作不变；校验通过后用 Anonymizer.planPersonTemplate 纯函数试算：
+  // 完全相同代号 -> 新增人物或合并称呼（去重）；某代号当前对应多位人物 -> 阻止应用。
+  // 确认后才真正修改状态：新增人物分配未使用 ID，仅保留候选集合未变的有效裁决，
+  // 其余共享称呼冲突回到待人工裁决；render() 统一重算预览 / 巡检 / 复核。
+  var pendingTemplate = null; // { tpl, plan }
+
+  function renderTemplateAliases(container, aliases) {
+    if (!aliases.length) {
+      var em = document.createElement('span');
+      em.className = 'alias-empty';
+      em.textContent = '（无称呼）';
+      container.appendChild(em);
+      return;
+    }
+    aliases.forEach(function (a) {
+      var t = document.createElement('span');
+      t.className = 'alias-tag';
+      t.textContent = a;
+      container.appendChild(t);
+    });
+  }
+
+  function openTemplateDialog(plan, tpl) {
+    pendingTemplate = { tpl: tpl, plan: plan };
+
+    // 阻止项：当前同一代号对应多位人物
+    templateAmbiguous.classList.toggle('hidden', !plan.ambiguous.length);
+    if (plan.ambiguous.length) {
+      templateAmbiguous.innerHTML = '';
+      var title = document.createElement('div');
+      title.textContent = '以下代号当前各对应多位人物，无法确定合并目标，已阻止应用。请先在侧栏「人物规则」中合并这些人物后再导入：';
+      templateAmbiguous.appendChild(title);
+      plan.ambiguous.forEach(function (a) {
+        var row = document.createElement('div');
+        row.textContent = '• 「' + a.codename + '」当前对应 ' + a.count + ' 位人物';
+        templateAmbiguous.appendChild(row);
+      });
+    }
+
+    // 将新增的人物
+    tplNewCount.textContent = plan.newPersons.length;
+    tplNewList.innerHTML = '';
+    if (!plan.newPersons.length) {
+      var noneN = document.createElement('li');
+      noneN.className = 'template-empty';
+      noneN.textContent = '（无）';
+      tplNewList.appendChild(noneN);
+    }
+    plan.newPersons.forEach(function (p) {
+      var li = document.createElement('li');
+      li.className = 'template-item';
+      var name = document.createElement('span');
+      name.className = 'template-item-name';
+      name.textContent = p.codename;
+      li.appendChild(name);
+      var tags = document.createElement('div');
+      tags.className = 'template-item-aliases';
+      renderTemplateAliases(tags, p.aliases);
+      li.appendChild(tags);
+      tplNewList.appendChild(li);
+    });
+
+    // 按完全相同代号合并的称呼
+    tplMergeCount.textContent = plan.merges.length;
+    tplMergeList.innerHTML = '';
+    if (!plan.merges.length) {
+      var noneM = document.createElement('li');
+      noneM.className = 'template-empty';
+      noneM.textContent = '（无）';
+      tplMergeList.appendChild(noneM);
+    }
+    plan.merges.forEach(function (mg) {
+      var li = document.createElement('li');
+      li.className = 'template-item';
+      var name = document.createElement('span');
+      name.className = 'template-item-name';
+      name.textContent = mg.codename;
+      li.appendChild(name);
+      var tags = document.createElement('div');
+      tags.className = 'template-item-aliases';
+      mg.addedAliases.forEach(function (a) {
+        var t = document.createElement('span');
+        t.className = 'alias-tag';
+        t.textContent = '＋ ' + a;
+        tags.appendChild(t);
+      });
+      li.appendChild(tags);
+      tplMergeList.appendChild(li);
+    });
+
+    // 由此产生的共享称呼
+    tplSharedCount.textContent = plan.shared.length;
+    tplSharedList.innerHTML = '';
+    if (!plan.shared.length) {
+      var noneS = document.createElement('li');
+      noneS.className = 'template-empty';
+      noneS.textContent = '（无）';
+      tplSharedList.appendChild(noneS);
+    }
+    plan.shared.forEach(function (sh) {
+      var li = document.createElement('li');
+      li.className = 'template-item';
+      var row = document.createElement('div');
+      row.className = 'ruling-row';
+      var alias = document.createElement('span');
+      alias.className = 'ruling-alias';
+      alias.textContent = sh.alias;
+      var kind = document.createElement('span');
+      kind.className = 'template-shared-kind kind-' + sh.kind;
+      kind.textContent = sh.kind === 'new' ? '新增冲突·待裁决' : '原裁决失效·待裁决';
+      var owners = document.createElement('span');
+      owners.className = 'ruling-hits';
+      owners.textContent = sh.owners.map(function (o) { return o.codename; }).join('、');
+      row.appendChild(alias); row.appendChild(kind); row.appendChild(owners);
+      li.appendChild(row);
+      tplSharedList.appendChild(li);
+    });
+
+    tplRetained.textContent = plan.retainedCount
+      ? '候选集合未变化的 ' + plan.retainedCount + ' 条既有裁决将继续保留。'
+      : '没有候选集合未变化的既有裁决需要保留。';
+    tplUnchanged.textContent = plan.unchanged
+      ? '另有 ' + plan.unchanged + ' 个代号称呼无新增，将保持不变。' : '';
+
+    var blocked = plan.ambiguous.length > 0;
+    var nothing = !plan.newPersons.length && !plan.merges.length && !plan.shared.length;
+    $('templateConfirm').disabled = blocked || nothing;
+    if (blocked) {
+      $('templateConfirm').title = '存在当前对应多位人物的代号，请先在编辑器中合并';
+    } else if (nothing) {
+      $('templateConfirm').title = '模板内容与当前人物规则一致，无需应用';
+    } else {
+      $('templateConfirm').title = '';
+    }
+    templateDialog.classList.remove('hidden');
+  }
+
+  function closeTemplateDialog() {
+    templateDialog.classList.add('hidden');
+    pendingTemplate = null;
+  }
+
+  // 确认应用：新增人物分配未使用 ID（personSeq 已为最大 ID 之后），合并称呼去重；
+  // 裁决只保留候选集合未变化的有效者；原稿 / 框选 / 例外 / 引文不动。整次一条撤销记录。
+  function confirmTemplateApply() {
+    var pending = pendingTemplate;
+    if (!pending) return;
+    var plan = pending.plan;
+    if (plan.ambiguous.length) return;
+
+    var rulingsBefore = snapshotRulings();
+    var created = [];
+    var mergeRecords = []; // { personId, aliasesBefore }
+
+    plan.merges.forEach(function (mg) {
+      var p = personById(mg.personId);
+      if (!p) return;
+      mergeRecords.push({ personId: p.id, aliasesBefore: p.aliases.slice() });
+      mg.addedAliases.forEach(function (a) {
+        if (p.aliases.indexOf(a) === -1) p.aliases.push(a);
+      });
+    });
+    plan.newPersons.forEach(function (np) {
+      var person = createPerson(np.codename, np.aliases.slice());
+      created.push(person);
+    });
+    state.rulings = Object.assign({}, plan.retainedRulings);
+
+    state.history.push({
+      type: 'templateApply',
+      created: created,
+      merges: mergeRecords,
+      rulingsBefore: rulingsBefore
+    });
+    closeTemplateDialog();
+    render();
+    toast('人物规则模板已应用：新增 ' + created.length + ' 位人物、合并 ' +
+      mergeRecords.length + ' 个代号的称呼，可撤销');
+  }
+
+  function downloadPersonTemplate() {
+    if (!state.persons.length) return; // 按钮已禁用，此处兜底
+    var tpl = Anonymizer.buildPersonTemplate(state.persons);
+    var blob = new Blob([JSON.stringify(tpl, null, 2)], { type: 'application/json;charset=utf-8' });
+    var url = URL.createObjectURL(blob);
+    var a = document.createElement('a');
+    a.href = url;
+    a.download = 'person-template.json';
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    setTimeout(function () { URL.revokeObjectURL(url); }, 0);
+    toast('已导出人物规则模板 person-template.json（不含原稿、框选、例外、引文与裁决）');
+  }
+
+  $('btnDownloadTemplate').addEventListener('click', downloadPersonTemplate);
+
+  $('btnImportTemplate').addEventListener('click', function () {
+    var input = $('templateFileInput');
+    input.value = ''; // 允许重复选择同一文件
+    input.click();
+  });
+
+  $('templateFileInput').addEventListener('change', function () {
+    var file = this.files && this.files[0];
+    if (!file) return;
+    var reader = new FileReader();
+    reader.onload = function () {
+      var tpl;
+      try {
+        tpl = JSON.parse(String(reader.result));
+      } catch (e) {
+        window.alert('人物规则模板导入失败：文件不是合法 JSON（' + e.message + '）。\n当前工作保持不变。');
+        return;
+      }
+      var errors = Anonymizer.validatePersonTemplate(tpl);
+      if (errors.length) {
+        window.alert('人物规则模板校验未通过，当前工作保持不变。发现 ' + errors.length + ' 处错误：\n\n' +
+          errors.map(function (er) { return '• ' + er.path + '：' + er.message; }).join('\n'));
+        return;
+      }
+      // 先整体试算（纯函数，不改动当前工作）
+      var plan = Anonymizer.planPersonTemplate(tpl, state.persons, state.rulings, personSeq);
+      openTemplateDialog(plan, tpl);
+    };
+    reader.onerror = function () {
+      window.alert('人物规则模板读取失败，当前工作保持不变。');
+    };
+    reader.readAsText(file, 'utf-8');
+  });
+
+  $('templateConfirm').addEventListener('click', confirmTemplateApply);
+  $('templateCancel').addEventListener('click', closeTemplateDialog);
+  templateDialog.addEventListener('mousedown', function (e) {
+    if (e.target === templateDialog) closeTemplateDialog(); // 点击遮罩关闭
   });
 
   // ---------- 双向高亮 ----------
@@ -1489,6 +1748,21 @@
         state.rulings = Object.assign({}, action.before);
         rulingToast = '已撤销对共享称呼「' + action.alias + '」的裁决';
         break;
+      case 'templateApply':
+        // 模板应用整批撤销：移除本次新增人物（连同其框选 / 例外，与撤销添加人物一致），
+        // 被合并代号的称呼还原，裁决恢复操作前快照；预览 / 巡检 / 复核随 render 重算
+        var createdIds = {};
+        action.created.forEach(function (p) { createdIds[p.id] = true; });
+        state.persons = state.persons.filter(function (p) { return !createdIds[p.id]; });
+        state.selections = state.selections.filter(function (s) { return !createdIds[s.personId]; });
+        state.exceptions = state.exceptions.filter(function (x) { return !createdIds[x.personId]; });
+        action.merges.forEach(function (mr) {
+          var p = personById(mr.personId);
+          if (p) p.aliases = mr.aliasesBefore.slice();
+        });
+        restoreRulingsSnapshot(action);
+        rulingToast = '已撤销人物规则模板应用';
+        break;
     }
     render();
     if (rulingToast) toast(rulingToast);
@@ -1617,7 +1891,7 @@
   });
 
   document.addEventListener('keydown', function (e) {
-    if (e.key === 'Escape') { closePopup(); closeMergeDialog(); closeBatchDialog(); }
+    if (e.key === 'Escape') { closePopup(); closeMergeDialog(); closeBatchDialog(); closeTemplateDialog(); }
   });
 
   // ---------- 合并人物弹窗 ----------
@@ -1660,6 +1934,7 @@
     activeCid = null;
     closeMergeDialog();
     closeBatchDialog();
+    closeTemplateDialog();
     inputSection.classList.add('hidden');
     editorSection.classList.remove('hidden');
     $('btnResetText').classList.remove('hidden');
@@ -1678,6 +1953,7 @@
     $('btnResetText').classList.add('hidden');
     closeMergeDialog();
     closeBatchDialog();
+    closeTemplateDialog();
     state.text = '';
     state.persons = [];
     state.selections = [];

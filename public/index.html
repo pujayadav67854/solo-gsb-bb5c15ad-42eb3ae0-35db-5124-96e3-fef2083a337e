@@ -15,8 +15,11 @@
       <button id="btnCopy" class="btn" disabled>复制匿名预览</button>
       <button id="btnDownloadPack" class="btn" disabled title="把当前工作（原稿、人物规则、框选、例外、裁决、引文、复核确认）保存为 version=1 的 JSON 工作包，全程浏览器本地完成">下载工作包</button>
       <button id="btnImportPack" class="btn" title="从本地 JSON 工作包恢复全部工作：先整体校验，任一错误按字段路径提示且当前工作不变；通过后一次性替换当前工作">导入工作包</button>
+      <button id="btnDownloadTemplate" class="btn" disabled title="把当前人物的统一代号与称呼导出为不含原稿的人物规则模板 JSON（version=1），全程浏览器本地完成">导出人物规则模板</button>
+      <button id="btnImportTemplate" class="btn" disabled title="从本地人物规则模板 JSON 导入：先整体校验版本、字段类型与模板内重复代号；通过后展示新增人物、按同代号合并的称呼与将产生的共享称呼，确认才应用">导入人物规则模板</button>
       <button id="btnResetText" class="btn btn-ghost hidden">重新粘贴原稿</button>
       <input type="file" id="packFileInput" accept=".json,application/json" class="hidden">
+      <input type="file" id="templateFileInput" accept=".json,application/json" class="hidden">
     </div>
   </header>
 
@@ -168,6 +171,35 @@
       <div class="modal-actions">
         <button id="mergeConfirm" class="btn btn-primary">确认合并（可撤销）</button>
         <button id="mergeCancel" class="btn">取消</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- 人物规则模板应用前预览弹窗 -->
+  <div id="templateDialog" class="modal hidden">
+    <div class="modal-card template-card">
+      <div class="modal-title">应用人物规则模板</div>
+      <div id="templateAmbiguous" class="template-ambiguous hidden"></div>
+      <div class="merge-preview">
+        <div class="template-section">
+          <div class="template-section-title">将新增的人物（<span id="tplNewCount">0</span>）</div>
+          <ul id="tplNewList" class="template-list"></ul>
+        </div>
+        <div class="template-section">
+          <div class="template-section-title">按完全相同代号合并称呼（<span id="tplMergeCount">0</span>）</div>
+          <ul id="tplMergeList" class="template-list"></ul>
+        </div>
+        <div class="template-section">
+          <div class="template-section-title">由此产生的共享称呼（<span id="tplSharedCount">0</span>，新冲突需人工裁决）</div>
+          <ul id="tplSharedList" class="template-list"></ul>
+        </div>
+        <div id="tplRetained" class="template-retained"></div>
+        <div id="tplUnchanged" class="template-note"></div>
+        <div class="batch-note">确认后为新增人物分配未使用 ID，合并称呼去重；仅保留候选集合未变化的有效裁决，新冲突待人工裁决，预览、巡检与复核随之重算；原稿、框选、例外、引文保持不变。整次应用作为一条撤销记录。</div>
+      </div>
+      <div class="modal-actions">
+        <button id="templateConfirm" class="btn btn-primary">确认应用（可撤销）</button>
+        <button id="templateCancel" class="btn">取消</button>
       </div>
     </div>
   </div>

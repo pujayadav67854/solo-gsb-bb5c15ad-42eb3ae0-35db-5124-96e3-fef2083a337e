@@ -551,6 +551,228 @@
     return errors;
   }
 
+  // ================= 人物规则模板（version=1，纯函数） =================
+  // 模板只保存人物代号与称呼：{ version, persons:[{ codename, aliases:[] }] }，
+  // 不含原稿、框选、例外、引文、裁决与任何 ID（ID 由应用方在导入时重新分配）。
+  var TEMPLATE_VERSION = 1;
+
+  /**
+   * 由当前人物规则生成模板对象（version=1），可直接 JSON.stringify 后下载。
+   * 不写入 id / color 等界面字段；当前工作中代号完全相同的多位人物导出时合并为
+   * 一项（称呼取并集、按首次出现顺序去重），以便导出的模板自身可再次通过校验。
+   *
+   * @param {Array} persons [{ codename, aliases: [] }]
+   * @returns {Object} 模板对象 { version, persons }
+   */
+  function buildPersonTemplate(persons) {
+    var order = [];
+    var aliasesByName = {};
+    (persons || []).forEach(function (p) {
+      var name = p.codename;
+      if (!Object.prototype.hasOwnProperty.call(aliasesByName, name)) {
+        aliasesByName[name] = [];
+        order.push(name);
+      }
+      (p.aliases || []).forEach(function (a) {
+        if (a && aliasesByName[name].indexOf(a) === -1) aliasesByName[name].push(a);
+      });
+    });
+    return {
+      version: TEMPLATE_VERSION,
+      persons: order.map(function (name) {
+        return { codename: name, aliases: aliasesByName[name].slice() };
+      })
+    };
+  }
+
+  /**
+   * 校验人物规则模板（version=1）。返回错误数组 [{ path, message }]，空数组表示通过；
+   * path 为具体字段路径（如 persons[2].codename、persons[0].aliases[1]）。
+   *
+   * 校验项：
+   *   1. 顶层必须为 JSON 对象，version 必须为 1（版本不符直接返回）；
+   *   2. persons 必须为对象数组；codename 必须为非空字符串；aliases 必须为字符串数组
+   *      且每个称呼非空（空白串视为非法）；
+   *   3. 模板内 codename 不得重复（重复代号无法确定合并目标）。
+   * 未列出的字段一律忽略（前向兼容）。校验失败时调用方不得改动当前工作。
+   *
+   * @param {*} tpl 待校验的模板（JSON.parse 结果）
+   * @returns {Array<{path:string, message:string}>}
+   */
+  function validatePersonTemplate(tpl) {
+    var errors = [];
+    function err(path, msg) { errors.push({ path: path, message: msg }); }
+
+    if (!tpl || typeof tpl !== 'object' || Array.isArray(tpl)) {
+      err('$', '人物规则模板必须是 JSON 对象');
+      return errors;
+    }
+    if (tpl.version !== TEMPLATE_VERSION) {
+      err('version', '必须为 ' + TEMPLATE_VERSION + '（当前人物规则模板格式版本），实际为 ' +
+        (tpl.version === undefined ? '（缺失）' : JSON.stringify(tpl.version)));
+      return errors;
+    }
+    var persons = tpl.persons;
+    if (!Array.isArray(persons)) { err('persons', '必须为数组'); return errors; }
+
+    var seen = {};
+    persons.forEach(function (p, i) {
+      var path = 'persons[' + i + ']';
+      if (!p || typeof p !== 'object' || Array.isArray(p)) { err(path, '必须为对象'); return; }
+      if (typeof p.codename !== 'string') {
+        err(path + '.codename', '必须为字符串（统一代号）');
+      } else if (!p.codename.trim()) {
+        err(path + '.codename', '统一代号不能为空');
+      } else if (seen[p.codename]) {
+        err(path + '.codename', '模板内代号重复：' + p.codename + '（首次出现在 ' + seen[p.codename] + '）');
+      } else {
+        seen[p.codename] = path;
+      }
+      if (!Array.isArray(p.aliases)) {
+        err(path + '.aliases', '必须为字符串数组（称呼列表）');
+      } else {
+        p.aliases.forEach(function (a, j) {
+          var ap = path + '.aliases[' + j + ']';
+          if (typeof a !== 'string') err(ap, '称呼必须为字符串');
+          else if (!a.trim()) err(ap, '称呼不能为空');
+        });
+      }
+    });
+    return errors;
+  }
+
+  function sameIdSet(a, b) {
+    if (!a || !b || a.length !== b.length) return false;
+    return a.every(function (id) { return b.indexOf(id) !== -1; });
+  }
+
+  /**
+   * 试算人物规则模板应用到当前人物规则后的结果（纯函数，不修改输入）。
+   *
+   * 匹配规则：模板人物按「完全相同的代号字符串」匹配当前人物——
+   *   - 该代号当前不存在：作为新增人物（id 从 nextId 起分配）；
+   *   - 恰好对应一位当前人物：把模板称呼中目标尚没有的部分合并进去（去重）；
+   *   - 同时对应多位当前人物：记入 ambiguous，调用方必须阻止应用。
+   *
+   * 共享称呼裁决：基于应用前后的 aliasOwners 候选集合——
+   *   - 候选集合（人物 ID 集合）完全未变、裁决仍指向候选人物的裁决保留；
+   *   - 因新增人物 / 合并称呼而新产生的多人共有称呼（kind='new'）回到待人工裁决；
+   *   - 原有冲突因候选集合变化而使裁决失效的（kind='dropped'）同样回到待人工裁决；
+   *   - 与本次变化无关、候选集合不变的称呼（含原本就未裁决者）不在 shared 中列出。
+   *
+   * @param {Object} template 已通过 validatePersonTemplate 的模板
+   * @param {Array} persons 当前人物 [{ id, codename, aliases }]
+   * @param {Object} adjudications 当前共享称呼裁决 { [alias]: personId }
+   * @param {number} nextId 新增人物的起始 ID（应用方应传入未使用的编号）
+   * @returns {Object} {
+   *   ambiguous: [{codename, count}],          // 阻止应用的代号（当前同代号多位人物）
+   *   newPersons: [{codename, aliases}],        // 将新增的人物
+   *   merges: [{codename, personId, addedAliases}], // 按同代号合并、确有新增称呼的人物
+   *   unchanged: number,                        // 代号已存在且称呼无新增的模板项数
+   *   shared: [{alias, kind:'new'|'dropped', ownerIds, owners:[{id,codename}]}],
+   *   retainedRulings: { [alias]: personId },   // 应用后应保留的裁决（候选集合未变）
+   *   retainedCount: number,
+   *   nextPersons: Array,                       // 模拟应用后的人物列表（含合成 ID）
+   *   nextId: number                            // 分配新增人物后的下一 ID
+   * }
+   */
+  function planPersonTemplate(template, persons, adjudications, nextId) {
+    persons = persons || [];
+    adjudications = adjudications || {};
+    var byCodename = {};
+    persons.forEach(function (p) {
+      (byCodename[p.codename] = byCodename[p.codename] || []).push(p);
+    });
+
+    var ambiguous = [];
+    var newPersons = [];
+    var merges = [];
+    var unchanged = 0;
+    // 在克隆上试算，绝不修改当前状态
+    var sim = persons.map(function (p) {
+      return { id: p.id, codename: p.codename, aliases: (p.aliases || []).slice() };
+    });
+    var idCursor = nextId;
+
+    (template.persons || []).forEach(function (tp) {
+      var matches = byCodename[tp.codename] || [];
+      // 模板校验已保证称呼为非空字符串；人物内 / 模板内重复称呼在此去重
+      var tplAliases = [];
+      tp.aliases.forEach(function (a) {
+        if (a.trim() && tplAliases.indexOf(a) === -1) tplAliases.push(a);
+      });
+      if (matches.length > 1) {
+        ambiguous.push({ codename: tp.codename, count: matches.length });
+        return;
+      }
+      if (matches.length === 0) {
+        sim.push({ id: idCursor++, codename: tp.codename, aliases: tplAliases.slice() });
+        newPersons.push({ codename: tp.codename, aliases: tplAliases.slice() });
+        return;
+      }
+      var target = null;
+      for (var i = 0; i < sim.length; i++) {
+        if (sim[i].id === matches[0].id) { target = sim[i]; break; }
+      }
+      var added = [];
+      tplAliases.forEach(function (a) {
+        if (target.aliases.indexOf(a) === -1) { target.aliases.push(a); added.push(a); }
+      });
+      if (added.length) {
+        merges.push({ codename: tp.codename, personId: target.id, addedAliases: added });
+      } else {
+        unchanged++;
+      }
+    });
+
+    var ownersBefore = aliasOwners(persons);
+    var ownersAfter = aliasOwners(sim);
+
+    // 仅列出「由此产生」的共享称呼：应用前不是多人共有 → new；
+    // 应用前已是冲突但候选集合变化（裁决随之失效）→ dropped；集合未变的不列出。
+    var shared = [];
+    Object.keys(ownersAfter).forEach(function (alias) {
+      var after = ownersAfter[alias];
+      if (after.length < 2) return;
+      var before = ownersBefore[alias];
+      if (sameIdSet(before, after)) return;
+      shared.push({
+        alias: alias,
+        kind: (!before || before.length < 2) ? 'new' : 'dropped',
+        ownerIds: after.slice(),
+        owners: after.map(function (id) {
+          for (var i = 0; i < sim.length; i++) {
+            if (sim[i].id === id) return { id: id, codename: sim[i].codename };
+          }
+          return { id: id, codename: '' };
+        })
+      });
+    });
+
+    // 仅保留候选集合未变化、裁决值仍属于候选人物的有效裁决；其余回到待人工裁决
+    var retainedRulings = {};
+    Object.keys(adjudications).forEach(function (alias) {
+      var pid = adjudications[alias];
+      var before = ownersBefore[alias];
+      var after = ownersAfter[alias];
+      if (after && after.length >= 2 && sameIdSet(before, after) && after.indexOf(pid) !== -1) {
+        retainedRulings[alias] = pid;
+      }
+    });
+
+    return {
+      ambiguous: ambiguous,
+      newPersons: newPersons,
+      merges: merges,
+      unchanged: unchanged,
+      shared: shared,
+      retainedRulings: retainedRulings,
+      retainedCount: Object.keys(retainedRulings).length,
+      nextPersons: sim,
+      nextId: idCursor
+    };
+  }
+
   return {
     anonymize: anonymize,
     aliasOwners: aliasOwners,
@@ -560,6 +782,10 @@
     classifyCandidates: classifyCandidates,
     WORK_PACK_VERSION: WORK_PACK_VERSION,
     buildWorkPack: buildWorkPack,
-    validateWorkPack: validateWorkPack
+    validateWorkPack: validateWorkPack,
+    TEMPLATE_VERSION: TEMPLATE_VERSION,
+    buildPersonTemplate: buildPersonTemplate,
+    validatePersonTemplate: validatePersonTemplate,
+    planPersonTemplate: planPersonTemplate
   };
 });
