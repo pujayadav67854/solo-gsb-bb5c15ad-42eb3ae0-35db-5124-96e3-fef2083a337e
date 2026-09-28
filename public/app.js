@@ -27,6 +27,16 @@
  * 区间合法），任一错误按字段路径逐条提示且当前工作不变；通过后一次性替换当前工作，
  * 复用匿名化引擎重算预览与巡检，复核确认仅保留与当前替换完全匹配者，撤销栈清空，
  * 继续新增人物或区间不复用文件中已有的 ID。文件读写全部在浏览器本地完成。
+ *
+ * 人物规则模板：侧栏「导出人物规则模板」把当前人物代号与称呼保存为 version=1 的
+ * JSON（不含原稿、框选、保留例外、裁决、引文与复核）；「导入人物规则模板」先整体
+ * 校验（版本 / 字段类型 / 模板内重复代号），任一错误按字段路径提示且当前工作不变。
+ * 校验通过后先展示应用预览：将新增的人物、按完全相同代号合并的称呼，以及应用后
+ * 需要人工裁决的共享称呼；当前同一代号对应多位人物时阻止应用并提示先去重 / 改名。
+ * 确认后为新增人物分配未使用 ID，合并称呼去重；仅保留候选集合未变化的有效裁决，
+ * 候选集合变化（冲突新增 / 扩大 / 消失）的裁决清除、新冲突不自动替换待人工裁决，
+ * 预览、巡检、引文与复核随渲染重算；原稿、框选、保留例外与引文不变。整次应用作为
+ * 一条撤销记录。文件读写全部在浏览器本地完成。
  */
 (function () {
   'use strict';
@@ -75,6 +85,15 @@
   var citationList = $('citationList');
   var reviewListEl = $('reviewList'), reviewStatsEl = $('reviewStats');
   var toastEl = $('toast');
+
+  // 人物规则模板弹窗
+  var templateDialog = $('templateDialog');
+  var tplSummary = $('tplSummary'), tplBlockers = $('tplBlockers');
+  var tplNewSection = $('tplNewSection'), tplNewList = $('tplNewList');
+  var tplMergeSection = $('tplMergeSection'), tplMergeList = $('tplMergeList');
+  var tplConflictSection = $('tplConflictSection'), tplConflictList = $('tplConflictList');
+  var tplUnaffectedNote = $('tplUnaffectedNote');
+  var tplConfirm = $('tplConfirm');
 
   // ---------- 工具 ----------
   function toast(msg) {
@@ -313,6 +332,7 @@
     $('btnUndo').disabled = state.history.length === 0;
     $('btnCopy').disabled = !state.text;
     $('btnDownloadPack').disabled = !state.text;
+    $('btnExportTemplate').disabled = !state.persons.length;
   }
 
   function renderPersons() {
@@ -1047,6 +1067,7 @@
     closePopup();
     closeMergeDialog();
     closeBatchDialog();
+    closeTemplateDialog();
     inputSection.classList.add('hidden');
     editorSection.classList.remove('hidden');
     $('btnResetText').classList.remove('hidden');
@@ -1088,6 +1109,339 @@
       window.alert('工作包读取失败，当前工作保持不变。');
     };
     reader.readAsText(file, 'utf-8');
+  });
+
+  // ---------- 人物规则模板（导出 / 导入 / 应用，全程浏览器本地完成） ----------
+  // 模板只含人物代号与称呼（version=1）：导出时由引擎 buildPersonTemplate 生成；
+  // 导入时先 validatePersonTemplate 整体校验（错误按路径提示且当前工作不变），
+  // 再 planPersonTemplate 按完全相同代号配对，弹出应用预览；当前同一代号对应多位
+  // 人物时阻止应用。确认后：新人物分配未使用 ID、合并称呼去重；仅保留候选集合
+  // 未变化的有效裁决，其余清除；render() 统一重算预览 / 巡检 / 引文 / 复核。
+  var pendingTemplate = null; // 应用预览上下文 { tpl, plan, personsBefore, rulingsBefore, groups }
+
+  function downloadPersonTemplate() {
+    if (!state.persons.length) return; // 按钮已禁用，此处兜底
+    var tpl = Anonymizer.buildPersonTemplate(state.persons);
+    var blob = new Blob([JSON.stringify(tpl, null, 2)], { type: 'application/json;charset=utf-8' });
+    var url = URL.createObjectURL(blob);
+    var a = document.createElement('a');
+    a.href = url;
+    a.download = 'person-rules.json';
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    setTimeout(function () { URL.revokeObjectURL(url); }, 0);
+    toast('已导出人物规则模板 person-rules.json（只含代号与称呼，不含原稿）');
+  }
+
+  function closeTemplateDialog() {
+    templateDialog.classList.add('hidden');
+    pendingTemplate = null;
+  }
+
+  // 对比应用前后的称呼归属与当前裁决，分组为：
+  // kept       应用前后候选人物集合完全相同且裁决仍有效（保留裁决）；
+  // pending    应用后需要人工裁决：
+  //              kind='new'     原本无冲突（仅一位人物登记 / 不存在），应用后成为多人共有；
+  //              kind='changed' 原本未裁决，本次导入使其候选人物集合扩大；
+  //              kind='dropped' 原本已有有效裁决，但候选集合扩大，原裁决清除、需重新裁决；
+  // unaffected 原本就未裁决且候选集合未变（保持不自动替换，不受本次导入影响）。
+  // 模板应用只会新增人物与称呼，称呼的候选人物集合只会扩大、不会缩小，故不存在冲突消失。
+  function classifyTemplateRulings(ownersBefore, personsAfter) {
+    var ownersAfter = Anonymizer.aliasOwners(personsAfter);
+    var byIdAfter = {};
+    personsAfter.forEach(function (p) { byIdAfter[p.id] = p; });
+    function codenameOf(id) { return byIdAfter[id] ? byIdAfter[id].codename : '（已删除）'; }
+    function sameSet(a, b) {
+      if (!a || !b || a.length !== b.length) return false;
+      return a.every(function (id) { return b.indexOf(id) !== -1; });
+    }
+    function makeItem(alias, ids, kind) {
+      return { alias: alias, ids: ids.slice(), kind: kind, codenames: ids.map(codenameOf) };
+    }
+
+    var kept = [], pending = [], unaffected = [];
+    var seen = {};
+    Object.keys(ownersBefore).forEach(function (alias) {
+      var beforeIds = ownersBefore[alias];
+      if (beforeIds.length < 2) return; // 应用前无冲突
+      seen[alias] = true;
+      var afterIds = ownersAfter[alias] || [];
+      var chosenId = state.rulings[alias];
+      var hadValid = beforeIds.indexOf(chosenId) !== -1;
+      if (afterIds.length >= 2 && sameSet(beforeIds, afterIds)) {
+        if (hadValid) kept.push(makeItem(alias, afterIds, 'kept'));
+        else unaffected.push(makeItem(alias, afterIds, 'unaffected'));
+      } else {
+        // 模板只会增加候选：afterIds 为扩大后的候选集合（至少两人）
+        pending.push(makeItem(alias, afterIds, hadValid ? 'dropped' : 'changed'));
+      }
+    });
+    // 应用后新出现的多人共有称呼
+    Object.keys(ownersAfter).forEach(function (alias) {
+      var afterIds = ownersAfter[alias];
+      if (afterIds.length < 2 || seen[alias]) return;
+      pending.push(makeItem(alias, afterIds, 'new'));
+    });
+    return { kept: kept, pending: pending, unaffected: unaffected };
+  }
+
+  function aliasTagsInto(container, aliases) {
+    if (!aliases.length) {
+      var em = document.createElement('span');
+      em.className = 'alias-empty';
+      em.textContent = '（无称呼）';
+      container.appendChild(em);
+      return;
+    }
+    aliases.forEach(function (a) {
+      var t = document.createElement('span');
+      t.className = 'alias-tag';
+      t.textContent = a;
+      container.appendChild(t);
+    });
+  }
+
+  function openTemplateDialog(tpl) {
+    var plan = Anonymizer.planPersonTemplate(state.persons, tpl.persons);
+
+    // 模拟应用后的人物集合（新人物使用负的临时 ID，仅用于计算称呼归属；确认时由
+    // createPerson 用 personSeq 分配真实未使用 ID，顺序与这里一致）
+    var personsAfter = state.persons.map(function (p) {
+      return { id: p.id, codename: p.codename, aliases: p.aliases.slice() };
+    });
+    var nextTmpId = -1;
+    plan.newPersons.forEach(function (np) {
+      personsAfter.push({ id: nextTmpId--, codename: np.codename, aliases: np.aliases.slice() });
+    });
+    plan.merges.forEach(function (mg) {
+      var target = personsAfter.filter(function (p) { return p.id === mg.targetId; })[0];
+      if (target) target.aliases = target.aliases.concat(mg.addAliases);
+    });
+
+    var ownersBefore = Anonymizer.aliasOwners(state.persons);
+    var groups = classifyTemplateRulings(ownersBefore, personsAfter);
+
+    // 阻断：当前同一代号对应多位人物（需人工改名 / 合并去重后再导入）
+    tplBlockers.innerHTML = '';
+    tplBlockers.classList.toggle('hidden', plan.blockers.length === 0);
+    if (plan.blockers.length) {
+      var title = document.createElement('div');
+      title.className = 'tpl-blockers-title';
+      title.textContent = '以下代号在当前人物中存在多位同代号人物，无法判断并入哪一位，已阻止应用；请先在人物列表中改名或合并去重后重新导入：';
+      tplBlockers.appendChild(title);
+      var ul = document.createElement('ul');
+      plan.blockers.forEach(function (b) {
+        var li = document.createElement('li');
+        var codenames = b.matchIds.map(function (id) {
+          var p = personById(id);
+          return p ? '「' + p.codename + '」(ID ' + id + ')' : 'ID ' + id;
+        }).join('、');
+        li.textContent = '「' + b.codename + '」当前对应 ' + b.matchIds.length +
+          ' 位人物：' + codenames;
+        ul.appendChild(li);
+      });
+      tplBlockers.appendChild(ul);
+    }
+
+    // 将新增的人物
+    tplNewList.innerHTML = '';
+    tplNewSection.classList.toggle('hidden', plan.newPersons.length === 0);
+    plan.newPersons.forEach(function (np) {
+      var li = document.createElement('li');
+      var head = document.createElement('div');
+      head.className = 'tpl-new-head';
+      head.textContent = np.codename;
+      var line = document.createElement('div');
+      line.className = 'tpl-alias-line';
+      aliasTagsInto(line, np.aliases);
+      li.appendChild(head);
+      li.appendChild(line);
+      tplNewList.appendChild(li);
+    });
+
+    // 按完全相同代号合并的称呼
+    tplMergeList.innerHTML = '';
+    tplMergeSection.classList.toggle('hidden', plan.merges.length === 0);
+    plan.merges.forEach(function (mg) {
+      var li = document.createElement('li');
+      var head = document.createElement('div');
+      head.className = 'tpl-merge-head';
+      var code = document.createElement('span');
+      code.className = 'tpl-merge-codename';
+      code.textContent = mg.codename;
+      var meta = document.createElement('span');
+      meta.className = 'tpl-merge-meta';
+      meta.textContent = '将并入 ' + mg.addAliases.length + ' 个新称呼' +
+        (mg.skippedAliases ? '；' + mg.skippedAliases + ' 个已存在，自动跳过（去重）' : '');
+      head.appendChild(code);
+      head.appendChild(meta);
+      var line = document.createElement('div');
+      line.className = 'tpl-alias-line';
+      aliasTagsInto(line, mg.addAliases);
+      li.appendChild(head);
+      li.appendChild(line);
+      tplMergeList.appendChild(li);
+    });
+
+    // 应用后需要人工裁决的共享称呼（新增冲突 / 候选扩大的未裁决 / 候选扩大致原裁决失效）
+    tplConflictList.innerHTML = '';
+    tplConflictSection.classList.toggle('hidden', groups.pending.length === 0 && groups.unaffected.length === 0);
+    var PENDING_DESC = {
+      new: '应用后成为多人共有的共享称呼，待人工裁决；裁决前该称呼不自动替换',
+      changed: '本次导入使候选人物增加（原未裁决），需重新人工裁决；裁决前该称呼不自动替换',
+      dropped: '原裁决的候选人物集合已扩大，原裁决将清除，需重新人工裁决；裁决前该称呼不自动替换'
+    };
+    groups.pending.forEach(function (c) {
+      var li = document.createElement('li');
+      var row = document.createElement('div');
+      row.className = 'tpl-conflict-row';
+      var alias = document.createElement('span');
+      alias.className = 'tpl-conflict-alias';
+      alias.textContent = c.alias;
+      var meta = document.createElement('span');
+      meta.className = 'tpl-conflict-meta danger';
+      meta.textContent = '候选人物：' + c.codenames.map(function (n) { return '「' + n + '」'; }).join('、');
+      row.appendChild(alias);
+      row.appendChild(meta);
+      li.appendChild(row);
+      var sub = document.createElement('div');
+      sub.className = 'tpl-conflict-meta';
+      sub.textContent = PENDING_DESC[c.kind];
+      li.appendChild(sub);
+      tplConflictList.appendChild(li);
+    });
+    tplUnaffectedNote.textContent = '';
+    tplUnaffectedNote.classList.add('hidden');
+    if (groups.unaffected.length) {
+      tplUnaffectedNote.textContent = '另有 ' + groups.unaffected.length +
+        ' 个原本就未裁决的共享称呼（候选集合未变），保持不自动替换：' +
+        groups.unaffected.map(function (c) { return '「' + c.alias + '」'; }).join('、');
+      tplUnaffectedNote.classList.remove('hidden');
+    }
+
+    // 汇总
+    var parts = ['模板人物 ' + tpl.persons.length + ' 位'];
+    parts.push('将新增 ' + plan.newPersons.length + ' 位');
+    var mergeAdds = plan.merges.reduce(function (n, m) { return n + m.addAliases.length; }, 0);
+    var mergeSkips = plan.merges.reduce(function (n, m) { return n + m.skippedAliases; }, 0);
+    parts.push('同代号合并 ' + plan.merges.length + ' 位（并入称呼 ' + mergeAdds +
+      ' 个' + (mergeSkips ? '，跳过重复 ' + mergeSkips + ' 个' : '') + '）');
+    parts.push('需人工裁决称呼 ' + groups.pending.length + ' 个');
+    parts.push('有效裁决保留 ' + groups.kept.length + ' 个');
+    if (groups.unaffected.length) parts.push('原未裁决保持 ' + groups.unaffected.length + ' 个');
+    tplSummary.textContent = parts.join(' ｜ ');
+
+    tplConfirm.disabled = plan.blockers.length > 0;
+    tplConfirm.title = plan.blockers.length
+      ? '存在同代号多人物冲突，无法应用，请先处理后重新导入'
+      : '整次应用作为一条可撤销记录；原稿、框选、保留例外与引文不变';
+
+    // 确认时所需的完整上下文（弹窗打开期间其他编辑被遮罩阻断，状态不会变化）
+    pendingTemplate = {
+      tpl: tpl,
+      plan: plan,
+      personsBefore: state.persons.map(function (p) {
+        return { id: p.id, codename: p.codename, aliases: p.aliases.slice(), color: p.color };
+      }),
+      rulingsBefore: Object.assign({}, state.rulings),
+      groups: groups
+    };
+    templateDialog.classList.remove('hidden');
+  }
+
+  function confirmTemplate() {
+    var ctx = pendingTemplate;
+    if (!ctx || ctx.plan.blockers.length) return;
+    var plan = ctx.plan;
+
+    // 新增人物：personSeq 依次分配未使用 ID（与预览中的临时 ID 顺序一致）
+    var newPeople = [];
+    plan.newPersons.forEach(function (np) {
+      newPeople.push(createPerson(np.codename, np.aliases.slice()));
+    });
+    // 同代号合并：称呼并入唯一匹配人物，去重（addAliases 在规划时已按当前称呼去重）
+    plan.merges.forEach(function (mg) {
+      var target = personById(mg.targetId);
+      if (!target) return;
+      mg.addAliases.forEach(function (a) {
+        if (target.aliases.indexOf(a) === -1) target.aliases.push(a);
+      });
+    });
+    // 仅保留候选集合未变化的有效裁决；候选集合扩大（冲突新增 / 候选增加）的一律清除，
+    // 新冲突不自动替换，待人工裁决（kept 分组已在预览阶段按归属集合严格比对得出）。
+    var keptRulings = {};
+    ctx.groups.kept.forEach(function (c) {
+      if (state.rulings[c.alias] !== undefined) keptRulings[c.alias] = state.rulings[c.alias];
+    });
+    state.rulings = keptRulings;
+
+    // 整次应用作为一条撤销记录：撤销时按完整快照还原人物列表（含新建人物的颜色）
+    // 与裁决集合；框选 / 例外只按 personId 引用，原 ID 恢复后仍有效
+    state.history.push({
+      type: 'templateApply',
+      personsBefore: ctx.personsBefore,
+      rulingsBefore: ctx.rulingsBefore
+    });
+
+    var pendingN = ctx.groups.pending.length;
+    closeTemplateDialog();
+    render(); // 统一重算预览、巡检、引文与复核清单（复核仅保留完全相同的替换确认）
+    toast('人物规则模板已应用：新增 ' + newPeople.length + ' 位人物、合并称呼 ' +
+      mergeAliasCount(plan) + ' 个' +
+      (pendingN ? '；' + pendingN + ' 个共享称呼待人工裁决（受影响的原裁决已清除）' : '') +
+      '，可撤销');
+  }
+
+  function mergeAliasCount(plan) {
+    return plan.merges.reduce(function (n, m) { return n + m.addAliases.length; }, 0);
+  }
+
+  $('btnExportTemplate').addEventListener('click', downloadPersonTemplate);
+
+  $('btnImportTemplate').addEventListener('click', function () {
+    var input = $('templateFileInput');
+    input.value = ''; // 允许重复选择同一文件
+    input.click();
+  });
+
+  $('templateFileInput').addEventListener('change', function () {
+    var file = this.files && this.files[0];
+    if (!file) return;
+    var reader = new FileReader();
+    reader.onload = function () {
+      var tpl;
+      try {
+        tpl = JSON.parse(String(reader.result));
+      } catch (e) {
+        window.alert('人物规则模板导入失败：文件不是合法 JSON（' + e.message + '）。\n当前工作保持不变。');
+        return;
+      }
+      var errors = Anonymizer.validatePersonTemplate(tpl);
+      if (errors.length) {
+        window.alert('人物规则模板校验未通过，当前工作保持不变。发现 ' + errors.length + ' 处错误：\n\n' +
+          errors.map(function (e2) { return '• ' + e2.path + '：' + e2.message; }).join('\n'));
+        return;
+      }
+      // 无阻断且既无新增人物、也无任何待并入称呼：没有可应用的变化，不弹窗、不入撤销栈
+      var prePlan = Anonymizer.planPersonTemplate(state.persons, tpl.persons);
+      var hasAdds = prePlan.merges.some(function (m) { return m.addAliases.length > 0; });
+      if (!prePlan.blockers.length && !prePlan.newPersons.length && !hasAdds) {
+        toast('模板中的代号当前均已存在且称呼完全一致，没有可应用的变化');
+        return;
+      }
+      openTemplateDialog(tpl);
+    };
+    reader.onerror = function () {
+      window.alert('人物规则模板读取失败，当前工作保持不变。');
+    };
+    reader.readAsText(file, 'utf-8');
+  });
+
+  $('tplConfirm').addEventListener('click', confirmTemplate);
+  $('tplCancel').addEventListener('click', closeTemplateDialog);
+  templateDialog.addEventListener('mousedown', function (e) {
+    if (e.target === templateDialog) closeTemplateDialog(); // 点击遮罩关闭
   });
 
   // ---------- 双向高亮 ----------
@@ -1489,6 +1843,16 @@
         state.rulings = Object.assign({}, action.before);
         rulingToast = '已撤销对共享称呼「' + action.alias + '」的裁决';
         break;
+      case 'templateApply':
+        // 整次模板应用撤销：人物列表与裁决集合恢复到应用前快照（对象即快照，直接替换）。
+        // 撤销为 LIFO：本记录弹出时其后的框选 / 例外记录均已撤销，不会有区间引用
+        // 随模板新建的人物 ID；原有人物按原 ID 恢复，其框选 / 例外引用继续有效。
+        state.persons = action.personsBefore.map(function (p) {
+          return { id: p.id, codename: p.codename, aliases: p.aliases.slice(), color: p.color };
+        });
+        state.rulings = Object.assign({}, action.rulingsBefore);
+        toast('已撤销人物规则模板的应用');
+        break;
     }
     render();
     if (rulingToast) toast(rulingToast);
@@ -1617,7 +1981,7 @@
   });
 
   document.addEventListener('keydown', function (e) {
-    if (e.key === 'Escape') { closePopup(); closeMergeDialog(); closeBatchDialog(); }
+    if (e.key === 'Escape') { closePopup(); closeMergeDialog(); closeBatchDialog(); closeTemplateDialog(); }
   });
 
   // ---------- 合并人物弹窗 ----------

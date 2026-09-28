@@ -52,6 +52,13 @@
         </form>
         <ul id="personList" class="person-list"></ul>
 
+        <div class="tpl-bar">
+          <button id="btnExportTemplate" class="btn btn-mini" disabled title="把当前人物代号与称呼导出为人物规则模板 JSON（version=1），不含原稿、框选、例外、裁决、引文与复核；全程浏览器本地完成">导出人物规则模板</button>
+          <button id="btnImportTemplate" class="btn btn-mini" title="从本地人物规则模板 JSON 导入：先整体校验版本、字段类型与模板内重复代号，错误按字段路径提示且当前工作不变；通过后预览将新增的人物、合并称呼与新冲突，确认才应用；不改动原稿、框选、例外与引文">导入人物规则模板</button>
+          <input type="file" id="templateFileInput" accept=".json,application/json" class="hidden">
+        </div>
+        <div class="hint tpl-hint">模板只含<b>人物代号与称呼</b>（version=1 的 JSON），不含原稿、框选、保留例外、裁决、引文与复核。导入按<b>完全相同代号</b>合并称呼（去重），无匹配代号的作为新人物；当前同一代号对应多位人物时会阻止应用。</div>
+
         <h2 class="sub-title">共享称呼裁决</h2>
         <div class="hint sub-hint">同一称呼登记在多位人物名下时在此裁决归属：列出冲突称呼、候选人物与原稿命中数。<b>未裁决的称呼不参与自动替换</b>（不再由人物列表顺序暗中决定代号）；选定后其自动命中按最长称呼、框选与保留例外优先级进入预览。人物删除或合并后失效裁决自动清除，冲突消失即恢复唯一归属，裁决可用「撤销最近操作」恢复。</div>
         <ul id="rulingList" class="ruling-list">
@@ -168,6 +175,35 @@
       <div class="modal-actions">
         <button id="mergeConfirm" class="btn btn-primary">确认合并（可撤销）</button>
         <button id="mergeCancel" class="btn">取消</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- 人物规则模板应用预览弹窗 -->
+  <div id="templateDialog" class="modal hidden">
+    <div class="modal-card">
+      <div class="modal-title">导入人物规则模板（应用预览）</div>
+      <div class="tpl-dialog-body">
+        <div id="tplSummary" class="tpl-summary"></div>
+        <div id="tplBlockers" class="tpl-blockers hidden"></div>
+        <div id="tplNewSection" class="tpl-section hidden">
+          <div class="tpl-section-title">将新增的人物</div>
+          <ul id="tplNewList" class="tpl-preview-list"></ul>
+        </div>
+        <div id="tplMergeSection" class="tpl-section hidden">
+          <div class="tpl-section-title">按完全相同代号合并的称呼</div>
+          <ul id="tplMergeList" class="tpl-preview-list"></ul>
+        </div>
+        <div id="tplConflictSection" class="tpl-section hidden">
+          <div class="tpl-section-title">应用后需要人工裁决的共享称呼</div>
+          <ul id="tplConflictList" class="tpl-preview-list"></ul>
+          <div id="tplUnaffectedNote" class="tpl-conflict-meta hidden"></div>
+        </div>
+        <div class="batch-note">确认后：为新增人物分配未使用 ID；合并称呼去重；候选集合未变化的有效裁决保留，候选集合变化（冲突新增 / 扩大 / 消失）的裁决清除，新冲突不自动替换、待人工裁决；预览、巡检、引文与复核随渲染重算。原稿、框选、保留例外与引文不变；整次应用作为一条可撤销记录。</div>
+      </div>
+      <div class="modal-actions">
+        <button id="tplConfirm" class="btn btn-primary">确认应用</button>
+        <button id="tplCancel" class="btn">取消</button>
       </div>
     </div>
   </div>
